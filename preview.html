@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>新标准日本语 · 电脑试用台</title><link rel="stylesheet" href="src/preview.css?v=20261001-mono"></head>
+<body>
+<header><div><span class="badge">新标准日本语 / 电脑试用</span><h1>先试一试，再装进 iPad。</h1><p>检查页面、试做课程，把你想改变的地方记下来。</p></div><a class="link" href="index.html" target="_blank" rel="noopener">打开正式学习页 ↗</a></header>
+<div class="layout"><aside>
+ <section><h2>01　选择页面</h2><div class="pages"><button data-view="home" class="active">学习首页</button><button data-view="kana">五十音</button><button data-view="review">错题复习</button><button data-view="grammar">语法手记</button><button data-view="settings">学习设置</button></div></section>
+ <section><h2>02　试做一课</h2><label for="book">教材册次</label><select id="book"></select><label for="lesson">课程</label><select id="lesson"></select><label for="step">从哪里开始</label><select id="step"><option value="">课前讲解 → 完整练习</option><option value="0">阅读选择</option><option value="1">听音选中文</option><option value="2">点击组句</option><option value="3">听音选日文</option><option value="4">中文转日文组句</option><option value="5">录音跟读</option></select><button class="primary" id="launch">打开这组练习 →</button></section>
+ <section class="scope"><h2>当前内容范围</h2><p>80 个课次 · 每课 2 句例句<br>每课 2 听力 + 3 阅读与组句 + 1 跟读</p><p><strong>仍待补充</strong><br>教材词汇覆盖、更多干扰选项、长对话与阅读、听写、间隔复习。中级目前为话题延伸练习，未逐条对齐教材。</p><p>这里的尺寸切换用于检查布局；iPad 原生录音和离线运行仍需 Xcode 模拟器或真机验证。</p></section>
+</aside><main>
+ <div class="toolbar"><div class="sizes" role="group" aria-label="预览尺寸"><button data-size="desktop" class="active" aria-pressed="true">电脑</button><button data-size="landscape" aria-pressed="false">iPad 横屏</button><button data-size="portrait" aria-pressed="false">iPad 竖屏</button></div><span id="dimensions">自适应宽度</span><a id="standalone" href="index.html?preview=1" target="_blank" rel="noopener">新窗口试用 ↗</a></div>
+ <p class="notice">试用记录与正式记录分开保存。切换页面或课程会退出当前练习；录音时请由你本人允许麦克风权限。</p>
+ <div id="stage"><div id="frameSpace"><iframe id="appFrame" title="新标准日本语应用试用" src="index.html?preview=1" allow="microphone 'self'" loading="eager"></iframe></div></div>
+ <section class="feedback"><div class="feedbackhead"><h2>03　你的体验与修改意见</h2><span id="saved" role="status">只保存到这台电脑</span></div><div class="checks" id="checks"></div><label for="notes">可以写下：哪一页不喜欢、课程太简单还是太难、希望增加什么内容。</label><textarea id="notes" rows="5" placeholder="例如：第 1 课我想先学单词再做题；希望加假名注音；听力应当有更多相近选项……"></textarea><div class="feedbackbottom"><small>勾选只表示你已检查，不代表功能已通过验证。</small><button id="export">导出试用反馈</button></div></section>
+</main></div><script type="module" src="src/preview.js"></script></body></html>
