@@ -85,7 +85,7 @@ const middle = [
 ];
 export const books = [{name:'初级 · 上册',range:'第 1–24 课',subtitle:'从第一句日语开始',count:24},{name:'初级 · 下册',range:'第 25–48 课',subtitle:'把想法说得更完整',count:24},{name:'中级 · 上册',range:'第 1–16 课',subtitle:'走进真实的交流',count:16},{name:'中级 · 下册',range:'第 17–32 课',subtitle:'理解语境，准确表达',count:16}];
 export const lessons = [...raw,...middle].map((row,id)=>{const [title,grammar,note,a,az,b,bz]=row.split('|');return {id,book:id<24?0:id<48?1:id<64?2:3,no:id<48?id+1:id-47,title,grammar,note,pairs:[{tokens:a.split(' '),zh:az},{tokens:b.split(' '),zh:bz}]};});
-export const sentence=p=>p.tokens.join('')+'。';
+export const sentence=p=>p.text??p.tokens.join('')+'。';
 export function questions(l){ const [a,b]=l.pairs;return [
 {type:'read',p:a,answer:a.zh,options:[a.zh,b.zh],prompt:'读懂这句话，选择正确的意思'},
 {type:'listen',p:b,answer:b.zh,options:[a.zh,b.zh],prompt:'听一听，选择你听到的意思'},

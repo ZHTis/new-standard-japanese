@@ -18,6 +18,7 @@ export function startNativeRecording(handlers) {
 }
 export function stopNativeRecording() { sendNative('stopRecording', { ticket }); }
 window.hiyoriNativeEvent = event => {
+  if(event.type === 'speechStarted'){window.dispatchEvent(new CustomEvent('hiyori-speech-start',{detail:event.text}));return;}
   if (event.type === 'message') {
     window.dispatchEvent(new CustomEvent('hiyori-message', { detail: event.message }));
     return;

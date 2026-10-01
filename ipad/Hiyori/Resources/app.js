@@ -87,7 +87,7 @@ const middle = [
 ];
 const books = [{name:'初级 · 上册',range:'第 1–24 课',subtitle:'从第一句日语开始',count:24},{name:'初级 · 下册',range:'第 25–48 课',subtitle:'把想法说得更完整',count:24},{name:'中级 · 上册',range:'第 1–16 课',subtitle:'走进真实的交流',count:16},{name:'中级 · 下册',range:'第 17–32 课',subtitle:'理解语境，准确表达',count:16}];
 const lessons = [...raw,...middle].map((row,id)=>{const [title,grammar,note,a,az,b,bz]=row.split('|');return {id,book:id<24?0:id<48?1:id<64?2:3,no:id<48?id+1:id-47,title,grammar,note,pairs:[{tokens:a.split(' '),zh:az},{tokens:b.split(' '),zh:bz}]};});
-const sentence=p=>p.tokens.join('')+'。';
+const sentence=p=>p.text??p.tokens.join('')+'。';
 function questions(l){ const [a,b]=l.pairs;return [
 {type:'read',p:a,answer:a.zh,options:[a.zh,b.zh],prompt:'读懂这句话，选择正确的意思'},
 {type:'listen',p:b,answer:b.zh,options:[a.zh,b.zh],prompt:'听一听，选择你听到的意思'},
@@ -117,6 +117,7 @@ function startNativeRecording(handlers) {
 }
 function stopNativeRecording() { sendNative('stopRecording', { ticket }); }
 window.hiyoriNativeEvent = event => {
+  if(event.type === 'speechStarted'){window.dispatchEvent(new CustomEvent('hiyori-speech-start',{detail:event.text}));return;}
   if (event.type === 'message') {
     window.dispatchEvent(new CustomEvent('hiyori-message', { detail: event.message }));
     return;
@@ -137,7 +138,7 @@ window.hiyoriNativeEvent = event => {
 function getPreviewConfig(search, native = false) {
   const params = new URLSearchParams(search);
   const enabled = !native && params.get('preview') === '1';
-  const views = ['home','kana','review','grammar','settings'];
+  const views = ['today','home','kana','review','grammar','settings'];
   const number = (key, max) => {
     const value=params.get(key);
     return value !== null && /^\d+$/.test(value) && Number(value)<=max ? Number(value) : null;
@@ -145,55 +146,333 @@ function getPreviewConfig(search, native = false) {
   return {
     enabled,
     storageKey: enabled ? 'hiyori-preview-v1' : 'hiyori-v1',
-    view: enabled && views.includes(params.get('view')) ? params.get('view') : 'home',
+    view: enabled ? (views.includes(params.get('view')) ? params.get('view') : 'home') : 'today',
     lesson: enabled ? number('lesson',79) : null,
     step: enabled ? number('step',5) : null
   };
 }
 
+// Personal content is loaded separately so it never enters the public bundle.
+function validMaterials(value) {
+ if(!value||typeof value!=='object')return {};
+ return Object.fromEntries(Object.entries(value).filter(([id,m])=>
+  /^\d+$/.test(id)&&Number(id)<80&&m&&typeof m.title==='string'&&
+  ['vocabulary','texts','grammar','questions','pages'].every(k=>Array.isArray(m[k]))&&
+  m.questions.every(q=>['read','listen','build','speak'].includes(q.type)&&q.p&&
+   typeof q.p.text==='string'&&Array.isArray(q.p.tokens)&&q.p.tokens.length&&q.p.tokens.every(t=>typeof t==='string'&&t)&&
+   (!['read','listen'].includes(q.type)||(Array.isArray(q.options)&&q.options.includes(q.answer)&&new Set(q.options).size===q.options.length)))
+ ));
+}
+function loadLocalMaterials() {
+ return new Promise(resolve=>{
+  const script=document.createElement('script');
+  script.src='private-materials/catalog.js';
+  script.onload=()=>resolve(validMaterials(window.hiyoriLocalMaterials));
+  script.onerror=()=>resolve({});
+  document.head.append(script);
+ });
+}
+function materialQueue(lesson,base,material,practiceOnly=true){
+ // Existing mistake records keep their original 0–5 indexes.
+ const all=[...base,...(material?.questions||[])].map((q,index)=>({...q,id:lesson.id,index}));
+ return practiceOnly&&material?.questions.length?all.slice(base.length):all;
+}
+
+// A transparent spaced-review scheduler. No network, model, or calendar simulation.
+const DAY_MS=86400000;
+const REVIEW_DAYS=[1,3,7,14,30,60];
+const adaptiveDay=time=>{const d=new Date(time);return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;};
+const normalized=text=>String(text).normalize('NFKC').replace(/\s/g,'');
+const mix=(items,random)=>{const out=[...items];for(let i=out.length-1;i>0;i--){const j=Math.floor(random()*(i+1));[out[i],out[j]]=[out[j],out[i]];}return out;};
+function learningPool(materials){
+ const pool=[];
+ for(const [lessonId,m] of Object.entries(materials).sort((a,b)=>Number(a[0])-Number(b[0]))){
+  const seen=new Set();
+  const add=(kind,ja,zh,audio,tokens,note)=>{
+   const key=`${lessonId}:${kind}:${encodeURIComponent(normalized(ja))}`;
+   if(!ja||!zh||seen.has(key))return;seen.add(key);
+   pool.push({key,lessonId:Number(lessonId),kind,ja,zh,audio:audio||ja,tokens:tokens||[ja],note:note||`${ja}：${zh}`});
+  };
+  for(const v of m.vocabulary)add('word',v.ja,v.zh,v.kana,null,`${v.ja}（${v.kana}）：${v.zh}`);
+  for(const t of m.texts)for(const line of t.lines){
+   const q=m.questions.find(q=>q.type==='build'&&normalized(q.p.text)===normalized(line.ja));
+   add('sentence',line.ja,line.zh,line.audio,q?.p.tokens,q?.explanation);
+  }
+ }
+ return pool;
+}
+function isMastered(record){return Boolean(record&&record.stage>=4&&record.modes?.listen&&(record.modes?.read||record.modes?.build));}
+function adaptiveStats(pool,records={},now=Date.now()){
+ const used=pool.filter(i=>records[i.key]);
+ return {total:pool.length,unseen:pool.length-used.length,active:used.filter(i=>!isMastered(records[i.key])).length,
+  mastered:used.filter(i=>isMastered(records[i.key])).length,due:used.filter(i=>records[i.key].due<=now).length,
+  introducedToday:used.filter(i=>records[i.key].introducedDay===adaptiveDay(now)).length,
+  nextDue:used.length?Math.min(...used.map(i=>records[i.key].due)):null};
+}
+function nextMode(item,record){
+ if(item.hasAudio===false)return item.tokens.length>1&&(record?.attempts||0)%2?'build':'read';
+ if(!record||!record.modes?.read)return 'read';
+ if(!record.modes?.listen)return 'listen';
+ const modes=item.kind==='sentence'&&item.tokens.length>1?['listen','build','read']:['listen','read'];
+ return modes[(record.attempts||0)%modes.length];
+}
+function choosePractice(pool,records={},now=Date.now(),random=Math.random){
+ // A backlog uses the whole session; no new cards while 12+ reviews are due.
+ const due=mix(pool.filter(i=>records[i.key]?.due<=now),random).sort((a,b)=>{
+  const ar=records[a.key],br=records[b.key];
+  return (ar.stage>0)-(br.stage>0)||ar.due-br.due;
+ }).slice(0,12);
+ const slots=Math.max(0,Math.min(6,12-due.length));
+ // Only introduce from the earliest unfinished lesson, never jump to advanced books.
+ const remaining=pool.filter(i=>!records[i.key]);
+ const first=remaining.length?Math.min(...remaining.map(i=>i.lessonId)):null;
+ const eligible=remaining.filter(i=>i.lessonId===first);
+ const words=mix(eligible.filter(i=>i.kind==='word'),random),sentences=mix(eligible.filter(i=>i.kind==='sentence'),random);
+ const fresh=[];
+ while(fresh.length<slots&&(words.length||sentences.length)){
+  const group=fresh.length%2===0?(words.length?words:sentences):(sentences.length?sentences:words);
+  fresh.push(group.pop());
+ }
+ // Fill extra practice from learned cards, with unmastered and least-recently
+ // answered cards first. No daily or active-card cap; mastery rules stay separate.
+ const selected=new Set([...due,...fresh].map(i=>i.key));
+ const onlyMastered=!remaining.length&&!pool.some(i=>records[i.key]&&!isMastered(records[i.key]));
+ const extra=mix(pool.filter(i=>records[i.key]&&!selected.has(i.key)&&(onlyMastered||!isMastered(records[i.key]))),random).sort((a,b)=>{
+  const ar=records[a.key],br=records[b.key];
+  return Number(isMastered(ar))-Number(isMastered(br))||(ar.lastAnswered||ar.introducedAt||0)-(br.lastAnswered||br.introducedAt||0);
+ }).slice(0,12-due.length-fresh.length);
+ const batch=[...due,...fresh,...extra];
+ let freshIndex=0;
+ const tasks=mix(batch,random).map(i=>({key:i.key,type:records[i.key]?nextMode(i,records[i.key]):(freshIndex++%3===2&&i.hasAudio!==false?'listen':'read'),fresh:!records[i.key]}));
+ // Keep a small optional speaking component. It never promotes memory mastery.
+ const speech=mix(batch.filter(i=>i.kind==='sentence'&&i.hasAudio!==false),random).slice(0,Math.ceil(tasks.length/6));
+ for(const item of speech)tasks.push({key:item.key,type:'speak',fresh:false});
+ return tasks;
+}
+function introduceItem(now){return {stage:0,due:now,introducedAt:now,introducedDay:adaptiveDay(now),attempts:0,lapses:0,modes:{},lastPromotionDay:null};}
+function recordRecall(previous,{correct,hinted=false,mode},now=Date.now()){
+ const r={...(previous||introduceItem(now)),modes:{...(previous?.modes||{})}};
+ // Viewing, introduction and recording alone are not evidence of recall.
+ if(!['read','listen','build'].includes(mode))return r;
+ r.attempts++;r.lastAnswered=now;
+ if(!correct){r.stage=0;r.lapses++;r.due=now+10*60*1000;return r;}
+ if(hinted){r.due=Math.max(r.due,now+DAY_MS);return r;}
+ r.modes[mode]=true;
+ const canPromote=now>=r.due&&r.lastPromotionDay!==adaptiveDay(now);
+ if(canPromote){r.stage=Math.min(6,r.stage+1);r.lastPromotionDay=adaptiveDay(now);r.due=now+REVIEW_DAYS[r.stage-1]*DAY_MS;}
+ else if(r.due<=now)r.due=now+DAY_MS;
+ return r;
+}
+function practiceQuestion(item,task,pool,random=Math.random){
+ const p={text:item.ja,zh:item.zh,audio:item.audio,tokens:item.tokens};
+ if(task.type==='speak')return {id:item.lessonId,type:'speak',p,prompt:'听示范，再录音跟读',explanation:item.note};
+ if(task.type==='build')return {id:item.lessonId,type:'build',p,prompt:'点击词块，回想这句话',explanation:item.note};
+ // Avoid close formulaic synonyms becoming competing correct choices.
+ const similar=[['はい','そうです'],['すみません','どうもすみません'],['よろしくお願いします','こちらこそ']];
+ const excluded=new Set(similar.find(g=>g.includes(item.ja))||[]);
+ const distractors=[...new Set(mix(pool.filter(i=>i.kind===item.kind&&i.key!==item.key&&!excluded.has(i.ja)),random).map(i=>i.zh))].filter(zh=>normalized(zh)!==normalized(item.zh)).slice(0,3);
+ return {id:item.lessonId,type:task.type,p,answerLang:'zh-CN',prompt:task.type==='listen'?'听一听，选出正确的意思':'读一读，选出正确的意思',answer:item.zh,options:[item.zh,...distractors],explanation:item.note};
+}
+function appendRetry(tasks,pos,retried,key){
+ if(retried.includes(key))return tasks;
+ // At least two other recall cards before a second attempt; otherwise wait 10 min.
+ const rest=tasks.slice(pos+1).filter(t=>t.key!==key&&t.type!=='speak');
+ if(rest.length<2)return tasks;
+ const third=rest[1],index=tasks.indexOf(third)+1;
+ const out=[...tasks];out.splice(index,0,{...tasks[pos],fresh:false,retry:true});return out;
+}
+
+// Only explicitly verified local recordings. Never substitute speech synthesis.
+const audioKey=text=>String(text).normalize('NFKC').replace(/\s/g,'');
+function verifiedClips(entries=[]){
+ const clips={};
+ if(!Array.isArray(entries))return clips;
+ for(const e of entries){
+  if(!e||e.verified!==true||e.kind!=='human'||typeof e.text!=='string'||!e.text||typeof e.source!=='string'||!e.source.trim()||typeof e.track!=='string'||!e.track.trim())continue;
+  if(typeof e.src!=='string'||!/^private-materials\/audio\/[\p{L}\p{N}_./ -]+\.(mp3|m4a|wav|ogg)$/u.test(e.src)||e.src.includes('..'))continue;
+  const start=e.start??0,end=e.end??null;
+  if(!Number.isFinite(start)||start<0||(end!==null&&(!Number.isFinite(end)||end<=start)))continue;
+  clips[audioKey(e.text)]={...e,start,end};
+ }
+ return clips;
+}
+function loadHumanAudio(){return new Promise(resolve=>{
+ const script=document.createElement('script');script.src='private-materials/audio-manifest.js';
+ script.onload=()=>resolve(verifiedClips(window.hiyoriHumanAudio));script.onerror=()=>resolve({});document.head.append(script);
+});}
+function recordingFor(clips,text){return clips[audioKey(text)]||null;}
+function createHumanPlayer(makeAudio=src=>new Audio(src)){
+ let current=null,timer=null,cancelPending=null;
+ function stop(){if(cancelPending){cancelPending();cancelPending=null;}clearInterval(timer);timer=null;if(current){current.pause();current.onloadedmetadata=null;current.onerror=null;current.onended=null;current=null;}}
+ async function play(clip,rate=1){
+  stop();if(!clip)throw new Error('missing');
+  const audio=makeAudio(clip.src);current=audio;audio.preload='auto';audio.playbackRate=rate;audio.preservesPitch=true;
+  try{
+   if(audio.readyState<1)await new Promise((resolve,reject)=>{cancelPending=resolve;audio.onloadedmetadata=()=>{cancelPending=null;resolve();};audio.onerror=()=>{cancelPending=null;reject(new Error('load'));};});
+   if(current!==audio)return false;
+   if(clip.start>=audio.duration||(clip.end!==null&&clip.end>audio.duration+.1))throw new Error('segment');
+   audio.currentTime=clip.start;await audio.play();
+   if(current!==audio){audio.pause();return false;}
+   if(clip.end!==null)timer=setInterval(()=>{if(audio.currentTime>=clip.end)stop();},25);
+   audio.onended=stop;return true;
+  }catch(error){if(current===audio)stop();throw error;}
+ }
+ return {play,stop};
+}
+
+// A question may render repeatedly while selecting tokens or receiving feedback.
+function createQuestionAutoplay({play,available,visible=()=>true}){
+ const attempted=new WeakMap();
+ return function autoplay(session){
+  const q=session?.queue[session.pos];
+  if(!session?.daily||!q||session.checked||!visible()||!available(q))return;
+  if(attempted.get(session)===session.pos)return;
+  attempted.set(session,session.pos);
+  play(q);
+ };
+}
+
+// One cancellable transition. Never advance a different question or a hidden page.
+function createAnswerFlow({current,advance,visible=()=>true,setTimer=setTimeout,clearTimer=clearTimeout,delay=800}){
+ let timer=null;
+ function cancel(){if(timer!==null)clearTimer(timer);timer=null;}
+ function schedule(){
+  cancel();const s=current();
+  if(!s||!s.checked||!s.feedback?.ok||s.explanationOpen||!visible())return;
+  const pos=s.pos;
+  timer=setTimer(()=>{timer=null;if(current()===s&&s.pos===pos&&s.checked&&s.feedback?.ok&&!s.explanationOpen&&visible())advance();},delay);
+ }
+ return {cancel,schedule};
+}
 
 
 
+
+
+
+
+
+let materials={},studyPool=[],dailyRefreshKey='',humanClips={};
+const humanPlayer=createHumanPlayer();
+const hasRecording=text=>Boolean(recordingFor(humanClips,text));
+const canReadSentence=text=>studyPool.some(i=>i.kind==='sentence'&&i.ja===text)||/[。？！?!]/.test(text);
+const canPlay=text=>hasRecording(text)||(canReadSentence(text)&&(isNative()||Boolean(window.speechSynthesis)));
+let speechStarted=null;
+function stopSpeech(){speechStarted=null;window.speechSynthesis?.cancel();if(isNative())cancelNative();}
+window.addEventListener('hiyori-speech-start',e=>speechStarted?.(e.detail));
+const autoplayQuestion=createQuestionAutoplay({play:q=>speak(sentence(q.p)),available:q=>canPlay(sentence(q.p)),visible:()=>!document.hidden});
 const $=s=>document.querySelector(s);
+const completed=l=>Boolean(state.done[l.id])&&(!materials[l.id]||state.done[l.id].materialVersion===materials[l.id].version);
+const lessonTitle=l=>materials[l.id]?.title||l.title;
 const preview=getPreviewConfig(location.search,isNative());
 const paths={home:'M3 10 12 3l9 7v10H3Z M9 20v-7h6v7',book:'M12 5C8 2 3 4 3 4v15s5-2 9 1c4-3 9-1 9-1V4s-5-2-9 1Zm0 0v15',review:'M4 8a8 8 0 1 1-1 7 M4 3v5h5 M12 8v5l3 2',grammar:'M5 3h14v18H5Z M8 7h8 M8 11h8 M8 15h5',settings:'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8 M12 2v3 M12 19v3 M2 12h3 M19 12h3 M5 5l2 2 M17 17l2 2 M5 19l2-2 M17 7l2-2',sound:'M11 4 6 8H3v8h3l5 4Z M15 8a6 6 0 0 1 0 8 M18 5a10 10 0 0 1 0 14',arrow:'M4 12h16 M14 6l6 6-6 6',check:'M5 12l4 4L19 6',leaf:'M20 3C7 1 1 12 7 18s17-2 13-15Z M5 21 16 8'};
 const icon=n=>`<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="${paths[n]||paths.book}"/></svg>`;
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const day=()=>new Date().toLocaleDateString('en-CA');
-let state;try{state=(!preview.enabled&&window.hiyoriSavedState)||JSON.parse(localStorage.getItem(preview.storageKey))}catch{}state={done:{},mistakes:[],days:{},goal:15,rate:.85,book:0,...state};
+let state;try{state=(!preview.enabled&&window.hiyoriSavedState)||JSON.parse(localStorage.getItem(preview.storageKey))}catch{}state={done:{},mistakes:[],days:{},goal:15,rate:.85,audioRate:1,book:0,...state};
+state.adaptive={records:{},run:null,...state.adaptive};
 let view=preview.view,book=state.book,session=null,recorder=null,stream=null,audioURL=null,recordTimer=null,recordPending=false;
+const answerFlow=createAnswerFlow({current:()=>session,advance:()=>advance(),visible:()=>!document.hidden});
 function save(){if(isNative())sendNative('save',{value:state});try{localStorage.setItem(preview.storageKey,JSON.stringify(state))}catch{toast('浏览器无法保存进度，请检查存储设置。')}}
 function toast(t){$('#toast').textContent=t;$('#toast').style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('#toast').style.display='none',4500)}
 const shuffled=a=>a.map(x=>({x,r:Math.random()})).sort((a,b)=>a.r-b.r).map(o=>o.x);
-function speak(text,slow=false){if(isNative()){sendNative('speak',{text,rate:slow?.6:Number(state.rate)});return}if(!('speechSynthesis'in window)){toast('此浏览器不支持朗读，请使用支持语音合成的浏览器。');return}const voices=speechSynthesis.getVoices().filter(v=>v.lang.startsWith('ja'));if(!voices.length){toast('未找到日语语音，请在系统语音设置中添加日语。');return}speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(text);u.lang='ja-JP';u.voice=voices[0];u.rate=slow?.6:Number(state.rate);u.onerror=e=>{if(e.error!=='interrupted'&&e.error!=='canceled')toast('朗读未能播放，请检查系统日语语音。')};speechSynthesis.speak(u)}
-if('speechSynthesis'in window)speechSynthesis.getVoices();
+function speak(text,slow=false){
+ const current=session,pos=session?.pos,clip=recordingFor(humanClips,text);
+ const heard=()=>{if(session===current&&current?.pos===pos&&current.queue[pos]?.p&&sentence(current.queue[pos].p)===text){current.heard=true;if(current.queue[pos].type==='listen'&&!current.checked)showStudy();}};
+ stopSpeech();humanPlayer.stop();
+ if(clip){humanPlayer.play(clip,slow?.75:Number(state.audioRate)||1).then(played=>{if(played)heard();}).catch(error=>{if(session===current&&current?.pos===pos)toast(error.name==='NotAllowedError'?'请点一下喇叭播放录音。':'录音无法播放，请检查本地音频文件。');});return;}
+ if(!canPlay(text)){toast('这项词汇的真人录音待导入。');return;}
+ const line=Object.values(materials).flatMap(m=>m.texts.flatMap(t=>t.lines)).find(x=>x.ja===text);
+ const reading=line?.audio||(current?.queue[pos]?.p&&sentence(current.queue[pos].p)===text?current.queue[pos].p.audio:null)||text;
+ if(isNative()){speechStarted=spoken=>{if(spoken===reading)heard();};sendNative('speak',{text:reading,rate:slow?.65:Number(state.audioRate)||1});return;}
+ const utterance=new SpeechSynthesisUtterance(reading);utterance.lang='ja-JP';
+ utterance.voice=window.speechSynthesis.getVoices().find(v=>/^ja(?:-|_)/i.test(v.lang))||null;
+ utterance.rate=slow?.65:Number(state.audioRate)||1;utterance.onstart=heard;
+ utterance.onerror=e=>{if(!['canceled','interrupted'].includes(e.error)&&session===current&&current?.pos===pos)toast('日语朗读未能播放，请检查系统日语语音或点击喇叭重试。');};
+ window.speechSynthesis.speak(utterance);
+}
+function audioSource(text){const clip=recordingFor(humanClips,text);return clip?`<p class="sub audio-source">真人录音 · ${esc(clip.source)} · ${esc(clip.track)}</p>`:`<p class="sub audio-source">${canReadSentence(text)?'机器朗读 · 日语':'真人录音待导入'}</p>`;}
+function labelAudioButtons(){document.querySelectorAll('[data-say]').forEach(b=>{if(!canPlay(b.dataset.say)){b.disabled=true;b.title='真人录音待导入';b.setAttribute('aria-label','真人录音待导入');}});}
+function missingAudio(q){return q&&['listen','speak'].includes(q.type)&&!canPlay(sentence(q.p));}
+function unavailableAudio(q){return `<h2>真人录音待导入</h2><p class="intro">这道${q.type==='listen'?'听力':'跟读'}题还没有核对过来源的录音。暂时跳过，不计对错，也不增加掌握程度。</p><button class="primary" id="skipMissingAudio">跳过此题，不计入掌握</button>`;}
 function render(){
- const labels={home:'课程',kana:'五十音',review:'错题复习',grammar:'语法',settings:'设置'};
- const total=Object.keys(state.done).length;
- $('#app').innerHTML=`<div class="shell"><aside class="sidebar"><div class="brand">新标准日本语</div><nav class="nav" aria-label="主导航">${[['home','book'],['kana','home'],['review','review'],['grammar','grammar'],['settings','settings']].map(([v,i])=>`<button data-nav="${v}" class="${view===v?'active':''}">${icon(i)}${labels[v]}</button>`).join('')}</nav></aside><main class="main"><header class="topbar"><div class="breadcrumb"><span class="mobilebrand">新标准日本语 / </span>${labels[view]}${preview.enabled?' · 试用':''}</div><span class="progresslabel">已学习 ${total} / 80 课</span></header><div id="page">${view==='home'?home():view==='kana'?kana():view==='review'?review():view==='grammar'?grammar():settings()}</div><footer class="footer"><span>原创配套练习 · 非教材官方产品</span>${preview.enabled?'<span>试用记录单独保存</span>':''}</footer></main></div>`;
- bind();
+ const labels={today:'混池',home:'课程',kana:'五十音',review:'错题复习',grammar:'语法',settings:'设置'};
+ const total=lessons.filter(completed).length;
+ $('#app').innerHTML=`<div class="shell"><aside class="sidebar"><div class="brand">新标准日本语</div><nav class="nav" aria-label="主导航">${[['today','review'],['home','book'],['kana','home'],['review','review'],['grammar','grammar'],['settings','settings']].map(([v,i])=>`<button data-nav="${v}" class="${view===v?'active':''}">${icon(i)}${labels[v]}</button>`).join('')}</nav></aside><main class="main"><header class="topbar"><div class="breadcrumb"><span class="mobilebrand">新标准日本语 / </span>${labels[view]}${preview.enabled?' · 试用':''}</div><span class="progresslabel">${view==='today'?`已掌握 ${adaptiveStats(studyPool,state.adaptive.records).mastered} 项`:`已学习 ${total} / 80 课`}</span></header><div id="page">${view==='today'?dailyHome():view==='home'?home():view==='kana'?kana():view==='review'?review():view==='grammar'?grammar():settings()}</div><footer class="footer"><span>个人学习 · 非教材官方产品</span>${preview.enabled?'<span>试用记录单独保存</span>':''}</footer></main></div>`;
+ bind();labelAudioButtons();
 }
 function home(){
- const ls=lessons.filter(l=>l.book===book),next=ls.find(l=>!state.done[l.id]);
+ const ls=lessons.filter(l=>l.book===book),next=ls.find(l=>!completed(l));
  const today=Math.floor((state.days[day()]||0)/60);
- return `<div class="heading"><div><h1>课程</h1><p class="sub">按教材顺序学习，也可直接选择课次。</p></div><button class="pill" data-nav="settings">今日 ${today} / ${state.goal} 分钟</button></div><div class="tabs" role="tablist">${books.map((b,i)=>`<button role="tab" aria-selected="${book===i}" data-book="${i}" class="${book===i?'active':''}">${b.name}</button>`).join('')}</div><p class="sub course-note">${book<2?'按课次核心语法编排 · 每课 6 组练习':'按课次话题编排 · 原创延伸句型，未逐条覆盖教材语法'}</p><section class="lessonlist">${ls.map((l,i)=>`${i%4===0?`<div class="unithead"><strong>第 ${Math.floor(i/4)+1} 单元</strong><small>${ls.slice(i,i+4).filter(x=>state.done[x.id]).length} / 4 课已学习</small></div>`:''}<button class="lesson ${l.id===next?.id?'current':''}" data-start="${l.id}"><span class="lessonnum">${String(l.no).padStart(2,'0')}</span><span class="lessontext"><strong>${l.title}</strong><p class="grammar-label">${esc(l.grammar)}</p></span><span class="lessonend">${state.done[l.id]?'已学习':l.id===next?.id?'开始学习':'学习'} ${icon('arrow')}</span></button>`).join('')}</section>`;
+ return `<div class="heading"><div><h1>课程</h1><p class="sub">按教材顺序学习，也可直接选择课次。</p></div><button class="pill" data-nav="settings">今日 ${today} / ${state.goal} 分钟</button></div><div class="tabs" role="tablist">${books.map((b,i)=>`<button role="tab" aria-selected="${book===i}" data-book="${i}" class="${book===i?'active':''}">${b.name}</button>`).join('')}</div><p class="sub course-note">${ls.some(l=>materials[l.id])?'带“教材已整理”的课程含词汇、课文与语法；其余仍为示例练习。':book<2?'当前为示例练习 · 每课 6 题，尚未导入教材内容':'当前为原创延伸练习 · 尚未导入教材内容'}</p><section class="lessonlist">${ls.map((l,i)=>`${i%4===0?`<div class="unithead"><strong>第 ${Math.floor(i/4)+1} 单元</strong><small>${ls.slice(i,i+4).filter(completed).length} / 4 课已学习</small></div>`:''}<button class="lesson ${l.id===next?.id?'current':''}" data-start="${l.id}"><span class="lessonnum">${String(l.no).padStart(2,'0')}</span><span class="lessontext"><strong ${materials[l.id]?'lang="ja"':''}>${esc(lessonTitle(l))}</strong>${materials[l.id]?'<small class="material-badge">教材已整理</small>':''}<p class="grammar-label">${esc(l.grammar)}</p></span><span class="lessonend">${completed(l)?'已学习':l.id===next?.id?'开始学习':'学习'} ${icon('arrow')}</span></button>`).join('')}</section>`;
 }
 const kanaRows=[['あいうえお','アイウエオ','a i u e o'],['かきくけこ','カキクケコ','ka ki ku ke ko'],['さしすせそ','サシスセソ','sa shi su se so'],['たちつてと','タチツテト','ta chi tsu te to'],['なにぬねの','ナニヌネノ','na ni nu ne no'],['はひふへほ','ハヒフヘホ','ha hi fu he ho'],['まみむめも','マミムメモ','ma mi mu me mo'],['や ゆ よ','ヤ ユ ヨ','ya - yu - yo'],['らりるれろ','ラリルレロ','ra ri ru re ro'],['わ   を','ワ   ヲ','wa - - - o'],['ん','ン','n']];
-function kana(){return `<div class="heading"><div><h1>五十音</h1><p class="sub">点击假名听发音。先认识平假名，再熟悉片假名。</p></div></div><div class="card full"><p class="sub" style="margin-bottom:23px">清音入门表 · 大字为平假名，小字为片假名与罗马音。助词 は、へ、を 分别读 wa、e、o。浊音、拗音和长音仍需专项学习。</p><div class="kana">${kanaRows.map(([h,k,r])=>[...h].map((c,i)=>c===' '?'<span></span>':`<button data-say="${c}" lang="ja">${c}<small><span lang="ja">${k[i]}</span> · <span lang="en">${r.split(' ')[i]}</span></small></button>`).join('')).join('')}</div></div>`}
-function review(){return `<div class="heading"><div><h1>错题复习</h1><p class="sub">答错的知识点会留在这里。复习答对后，自动移出错题本。</p></div></div>${state.mistakes.length?`<div class="card full"><h3>${state.mistakes.length} 道题，值得再想一遍</h3><button class="primary" id="reviewStart">开始错题复习 ${icon('arrow')}</button></div>${state.mistakes.map(m=>{const l=lessons[m.id];return `<div class="card full"><h3>${books[l.book].name} · 第 ${l.no} 课　${l.title}</h3><p class="jp">${l.grammar}</p><p class="sub">${l.note}</p></div>`}).join('')}`:`<div class="card full empty"><h2>暂无错题</h2><p class="sub">答错的题目会保存在这里。</p><button class="primary" style="margin-top:25px" data-nav="home">去学习</button></div>`}`}
+function kana(){return `<div class="heading"><div><h1>五十音</h1><p class="sub">先认识平假名，再熟悉片假名。真人发音录音待导入。</p></div></div><div class="card full"><p class="sub" style="margin-bottom:23px">清音入门表 · 大字为平假名，小字为片假名与罗马音。助词 は、へ、を 分别读 wa、e、o。浊音、拗音和长音仍需专项学习。</p><div class="kana">${kanaRows.map(([h,k,r])=>[...h].map((c,i)=>c===' '?'<span></span>':`<button data-say="${c}" lang="ja">${c}<small><span lang="ja">${k[i]}</span> · <span lang="en">${r.split(' ')[i]}</span></small></button>`).join('')).join('')}</div></div>`}
+function review(){const count=studyPool.filter(i=>state.adaptive.records[i.key]?.lapses&&state.adaptive.records[i.key].stage===0).length;return `<div class="heading"><div><h1>错题复习</h1><p class="sub">课程练习的错题保存在这里；混池的错项会自动安排再次出现。</p></div></div>${count?`<div class="card full"><p class="intro">混学中有 ${count} 项需要巩固，会按到期时间自动安排。</p><button class="pill" data-nav="today">查看混池</button></div>`:''}${state.mistakes.length?`<div class="card full"><h3>${state.mistakes.length} 道题，值得再想一遍</h3><button class="primary" id="reviewStart">开始错题复习 ${icon('arrow')}</button></div>${state.mistakes.map(m=>{const l=lessons[m.id],q=materialQueue(l,questions(l),materials[l.id],false)[m.index];return `<div class="card full"><h3>${books[l.book].name} · 第 ${l.no} 课　${esc(lessonTitle(l))}</h3><p class="jp" lang="ja">${esc(q?sentence(q.p):l.grammar)}</p><p class="sub">${esc(q?.explanation||l.note)}</p></div>`}).join('')}`:`<div class="card full empty"><h2>暂无错题</h2><p class="sub">答错的题目会保存在这里。</p><button class="primary" style="margin-top:25px" data-nav="home">去学习</button></div>`}`}
 function grammar(){return `<div class="heading"><div><h1>语法</h1><p class="sub">中文解释，日语例句。把零散的知识连起来。</p></div></div><input class="search" id="grammarSearch" aria-label="搜索语法" placeholder="搜索句型、主题或中文解释，例如：条件、と思います"><div class="grid" id="grammarGrid" style="margin-top:23px">${grammarCards(lessons)}</div>`}
-function grammarCards(ls){return ls.length?ls.map(l=>`<div class="card grammarcard"><div class="eyebrow">${books[l.book].name} · 第 ${l.no} 课</div><p class="jp">${l.grammar}</p><p>${l.note}</p><button class="textbtn" data-start="${l.id}">练习这个知识点 →</button></div>`).join(''):'<p class="sub">没有找到对应内容，试试其他关键词。</p>'}
-function settings(){return `<h1>设置</h1><div class="card full" style="margin-top:25px"><div class="formrow"><label for="goal">每日学习目标</label><select id="goal">${[10,15,20,30].map(n=>`<option value="${n}" ${state.goal===n?'selected':''}>${n} 分钟 / 天</option>`).join('')}</select></div><div class="formrow"><label for="rate">日语朗读语速</label><select id="rate">${[[.65,'慢速'],[.85,'适中'],[1,'正常']].map(([n,t])=>`<option value="${n}" ${Number(state.rate)===n?'selected':''}>${t}</option>`).join('')}</select></div><button class="pill" data-say="こんにちは。今日も一緒に勉強しましょう。">${icon('sound')} 试听日语语音</button><p class="sub" style="margin-top:22px">${isNative()?'课程已内置，可离线学习。进度保存在这台 iPad；录音仅用于本次练习，不上传，退出或进入后台时释放。朗读使用系统日语语音，首次可能需要联网下载语音。':'进度只保存在当前浏览器。录音只在本次练习中回放，不上传。朗读使用设备的日语语音，可能需要先安装日语语音包。'}</p><hr style="border:0;border-top:1px solid var(--line);margin:25px 0"><details><summary>课程与内容说明</summary><p class="sub">覆盖初级上下册 48 课、中级上下册 32 课的课程框架。每课当前包含 2 个原创例句及 6 组核心练习，属于可使用的基础版本，不是完整教材替代品。初级按课次语法主线，中级按话题配置延伸句型，未逐条核对教材全部语法。听力 2 题、阅读与组句 3 题、口语 1 题；口语采用自评，不自动判断发音。</p><p class="sub" style="margin-top:15px">课程结构参考：<a href="https://www.jpedo.com/news/2079.html" target="_blank" rel="noreferrer">新版标日课程目录</a> · <a href="https://www.mitsumura-tosho.co.jp/shoseki/nihongo/s" target="_blank" rel="noreferrer">出版社介绍</a></p></details></div>`}
-function bind(){document.querySelectorAll('[data-nav]').forEach(b=>b.onclick=()=>{view=b.dataset.nav;render();window.scrollTo(0,0)});document.querySelectorAll('[data-book]').forEach(b=>b.onclick=()=>{book=Number(b.dataset.book);state.book=book;save();render()});bindStarts();document.querySelectorAll('[data-say]').forEach(b=>b.onclick=()=>speak(b.dataset.say));if($('#goal'))$('#goal').onchange=e=>{state.goal=Number(e.target.value);save();toast('学习目标已保存')};if($('#rate'))$('#rate').onchange=e=>{state.rate=Number(e.target.value);save();toast('朗读语速已保存')};if($('#grammarSearch'))$('#grammarSearch').oninput=e=>{const q=e.target.value.toLowerCase();$('#grammarGrid').innerHTML=grammarCards(lessons.filter(l=>`${l.title}${l.grammar}${l.note}`.toLowerCase().includes(q)));bindStarts()};if($('#reviewStart'))$('#reviewStart').onclick=startReview;}
+function grammarCards(ls){return ls.length?ls.map(l=>(materials[l.id]?.grammar||[{title:l.grammar,note:l.note}]).map(g=>`<div class="card grammarcard"><div class="eyebrow">${books[l.book].name} · 第 ${l.no} 课${materials[l.id]?" · 教材笔记":" · 示例"}</div><p class="jp">${esc(g.title)}</p><p>${esc(g.note)}</p>${g.example?`<p class="jp" lang="ja">${esc(g.example)}</p>`:""}<button class="textbtn" data-start="${l.id}">进入本课学习 →</button></div>`).join('')).join(''):'<p class="sub">没有找到对应内容，试试其他关键词。</p>'}
+function settings(){return `<h1>设置</h1><div class="card full" style="margin-top:25px"><div class="formrow"><label for="goal">每日学习目标</label><select id="goal">${[10,15,20,30].map(n=>`<option value="${n}" ${state.goal===n?'selected':''}>${n} 分钟 / 天</option>`).join('')}</select></div><div class="formrow"><label for="rate">朗读播放速度</label><select id="rate">${[[.75,'0.75 倍'],[.85,'0.85 倍'],[1,'原速']].map(([n,t])=>`<option value="${n}" ${Number(state.audioRate)===n?'selected':''}>${t}</option>`).join('')}</select></div><p class="intro">已接入 ${Object.keys(humanClips).length} 段有来源的真人录音。</p><p class="sub">优先播放已导入录音；句子缺少录音时使用日语机器朗读。</p><p class="sub"><a href="https://ebook.pep.com.cn/lry/bmxy.html" target="_blank" rel="noreferrer">人教社官方音频资源与使用说明</a></p><p class="sub" style="margin-top:22px">${isNative()?'课程已内置，可离线学习。进度保存在这台 iPad；录音仅用于本次练习，不上传，退出或进入后台时释放。已导入的真人录音随课程内置。':'进度只保存在当前浏览器。录音只在本次练习中回放，不上传。已有录音优先，句子缺少录音时使用系统日语朗读。'}</p><hr style="border:0;border-top:1px solid var(--line);margin:25px 0"><details><summary>课程与内容说明</summary><p class="sub">覆盖初级上下册 48 课、中级上下册 32 课的课程框架。已整理的本地教材课程在列表单独标记，包含词汇、课文、语法与配套练习。其他课次仍只有 2 个原创例句及 6 组示例练习，不是完整教材。初级按课次语法主线，中级按话题配置延伸句型，未逐条核对教材全部语法。示例课程听力 2 题、阅读与组句 3 题、口语 1 题。教材课程的题量见课内说明；口语采用自评，不自动判断发音。句子的机器朗读会明确标注，之后导入录音即自动优先使用录音。</p><p class="sub" style="margin-top:15px">课程结构参考：<a href="https://www.jpedo.com/news/2079.html" target="_blank" rel="noreferrer">新版标日课程目录</a> · <a href="https://www.mitsumura-tosho.co.jp/shoseki/nihongo/s" target="_blank" rel="noreferrer">出版社介绍</a></p></details></div>`}
+function bind(){document.querySelectorAll('[data-nav]').forEach(b=>b.onclick=()=>{view=b.dataset.nav;render();window.scrollTo(0,0)});document.querySelectorAll('[data-book]').forEach(b=>b.onclick=()=>{book=Number(b.dataset.book);state.book=book;save();render()});bindStarts();document.querySelectorAll('[data-say]').forEach(b=>b.onclick=()=>speak(b.dataset.say));if($('#goal'))$('#goal').onchange=e=>{state.goal=Number(e.target.value);save();toast('学习目标已保存')};if($('#rate'))$('#rate').onchange=e=>{state.audioRate=Number(e.target.value);save();toast('录音播放速度已保存')};if($('#grammarSearch'))$('#grammarSearch').oninput=e=>{const q=e.target.value.toLowerCase();$('#grammarGrid').innerHTML=grammarCards(lessons.filter(l=>`${lessonTitle(l)}${l.grammar}${l.note}${materials[l.id]?.grammar.map(g=>g.title+g.note+g.example).join('')||''}`.toLowerCase().includes(q)));bindStarts()};if($('#reviewStart'))$('#reviewStart').onclick=startReview;if($('#dailyStart'))$('#dailyStart').onclick=startDaily;}
 function bindStarts(){document.querySelectorAll('[data-start]').forEach(b=>b.onclick=()=>start(Number(b.dataset.start)))}
-function start(id){session={lesson:lessons[id],queue:questions(lessons[id]).map((q,index)=>({...q,id,index})),pos:-1,right:0,graded:0,unscored:0,spoken:false,started:Date.now(),seconds:0};showStudy()}
-function startReview(){session={lesson:lessons[state.mistakes[0].id],queue:state.mistakes.map(m=>({...questions(lessons[m.id])[m.index],...m})),pos:0,right:0,graded:0,unscored:0,review:true,started:Date.now(),seconds:0};prepare();showStudy()}
-function prepare(){session.selected=null;session.tokens=[];session.checked=false;session.feedback=null;const q=session.queue[session.pos];session.pool=shuffled(q.p.tokens.map((t,i)=>({t,i})));session.options=q.options?shuffled(q.options):[];session.recorded=false;session.skipped=false;session.showText=false;}
-function cleanup(){cancelNative();recordPending=false;clearTimeout(recordTimer);if(recorder&&recorder.state!=='inactive'){recorder.onstop=null;recorder.stop()}stream?.getTracks().forEach(t=>t.stop());stream=null;recorder=null;if(audioURL){URL.revokeObjectURL(audioURL);audioURL=null}window.speechSynthesis?.cancel()}
-function showStudy(){let overlay=$('.overlay');if(!overlay){overlay=document.createElement('div');overlay.className='overlay';overlay.setAttribute('role','dialog');overlay.setAttribute('aria-modal','true');overlay.setAttribute('aria-label','日语练习');document.body.append(overlay);$('.shell').inert=true;document.body.style.overflow='hidden'}const s=session;const q=s.queue[s.pos];const l=q?lessons[q.id]:s.lesson;overlay.innerHTML=`<div class="study"><div class="studyheader"><button class="close" id="quit" aria-label="退出练习">×</button><div class="progress"><span style="width:${Math.max(0,s.pos)/s.queue.length*100}%"></span></div><small>${s.pos<0?'课前手记':Math.min(s.pos+1,s.queue.length)+' / '+s.queue.length}</small></div><div class="eyebrow">${books[l.book].name} · 第 ${l.no} 课 · ${s.review?'错题复习':l.title}</div>${s.pos<0?intro(l):s.pos>=s.queue.length?result():exercise(q,l)}</div>`;$('#quit').onclick=quit;if(s.pos<0){$('#begin').onclick=()=>{s.pos=0;prepare();showStudy()};document.querySelectorAll('[data-say]').forEach(b=>b.onclick=()=>speak(b.dataset.say));}else if(s.pos>=s.queue.length){$('#finish').onclick=quit;}else bindExercise(q);overlay.querySelector('h2')?.setAttribute('tabindex','-1');}
-function intro(l){return `<h2>先理解，再练习。</h2><span class="bigjp">${l.grammar}</span><p class="intro">${l.note}</p>${l.pairs.map(p=>`<div class="example"><div><div class="jp" lang="ja">${sentence(p)}</div><p>${p.zh}</p></div><button class="sound" data-say="${esc(sentence(p))}" aria-label="朗读例句">${icon('sound')}</button></div>`).join('')}<div class="checkrow"><span class="muted">2 听力 · 3 阅读与组句 · 1 跟读</span><button class="primary" id="begin">开始练习 ${icon('arrow')}</button></div>`}
-function exercise(q,l){const s=session;return `<h2>${q.prompt}</h2>${q.type==='read'?`<div class="bigjp" lang="ja">${sentence(q.p)}</div>`:''}${q.type==='listen'?`<div class="listenarea"><button class="sound" id="play" aria-label="播放日语音频">${icon('sound')}</button><button class="pill" id="slow">慢速播放</button></div><button class="textbtn" id="transcript">${s.showText?'已显示原文，本题不计分':'无法听音？显示原文并跳过计分'}</button>${s.showText?`<p class="bigjp" lang="ja">${sentence(q.p)}</p>`:''}`:''}${q.options?`<div class="options">${s.options.map((o,i)=>`<button class="option ${s.selected===o?'selected':''}" data-option="${i}" ${s.checked?'disabled':''}><span class="key">${i+1}</span><span lang="${q.answer===sentence(q.p)?'ja':'zh-CN'}">${esc(o)}</span></button>`).join('')}</div>`:''}${q.type==='build'?`<p class="intro">${q.p.zh}</p><div class="answerline">${s.tokens.map(i=>`<button class="token" lang="ja" data-remove="${i}" ${s.checked?'disabled':''}>${q.p.tokens[i]}</button>`).join('')}</div><div class="tokens">${s.pool.map(({t,i})=>`<button class="token" lang="ja" data-token="${i}" ${s.tokens.includes(i)||s.checked?'disabled':''}>${t}</button>`).join('')}</div>`:''}${q.type==='speak'?`<div class="example"><div><div class="jp" lang="ja">${sentence(q.p)}</div><p>${q.p.zh}</p></div><button class="sound" id="play" aria-label="示范朗读">${icon('sound')}</button></div><div class="recorder"><p>听示范 → 录音 → 回放对比<br>注意句末发音、助词和停顿。本题通过自评完成。</p><button class="primary" id="record">${s.recorded?'重新录音':'开始录音'}</button><div id="recordingArea">${audioURL?`<audio controls src="${audioURL}"></audio>`:''}</div><p id="recordStatus" role="status">${s.recorded?'回放自己的录音，再决定是否掌握。':'录音最长 30 秒，仅用于本次回放。'}</p></div><div style="margin-top:20px"><button class="textbtn" id="skipSpeak">暂时不方便开口，跳过口语</button></div>`:''}${s.feedback?`<div class="feedback ${s.feedback.ok?'':'wrong'}" role="status"><strong>${s.feedback.title}</strong><div>${s.feedback.text}</div></div>`:''}<div class="checkrow"><span class="muted">${q.type==='speak'?'口语自评不计入客观正确率':'慢慢想，不限答题时间'}</span><button class="primary" id="check" ${!s.checked&&(q.type==='build'?s.tokens.length!==q.p.tokens.length:q.type==='speak'?!s.recorded:s.selected===null)?'disabled':''}>${s.checked?'继续':q.type==='speak'?'我已回听并完成跟读':'检查答案'} ${icon('arrow')}</button></div>`}
-function bindExercise(q){const s=session;document.querySelectorAll('[data-option]').forEach(b=>b.onclick=()=>{s.selected=s.options[Number(b.dataset.option)];showStudy()});document.querySelectorAll('[data-token]').forEach(b=>b.onclick=()=>{s.tokens.push(Number(b.dataset.token));showStudy()});document.querySelectorAll('[data-remove]').forEach(b=>b.onclick=()=>{s.tokens=s.tokens.filter(i=>i!==Number(b.dataset.remove));showStudy()});if($('#play'))$('#play').onclick=()=>speak(sentence(q.p));if($('#slow'))$('#slow').onclick=()=>speak(sentence(q.p),true);if($('#transcript'))$('#transcript').onclick=()=>{s.showText=true;showStudy()};if($('#record'))$('#record').onclick=record;if($('#skipSpeak'))$('#skipSpeak').onclick=()=>{s.skipped=true;advance()};$('#check').onclick=()=>{if(s.checked){advance();return}if(q.type==='speak'){s.spoken=true;advance();return}const correct=q.type==='build'?s.tokens.map(i=>q.p.tokens[i]).join('')===q.p.tokens.join(''):s.selected===q.answer;if(s.showText)s.unscored++;if(!s.showText){s.graded++;if(correct)s.right++;const exists=state.mistakes.some(m=>m.id===q.id&&m.index===q.index);if(correct&&s.review)state.mistakes=state.mistakes.filter(m=>!(m.id===q.id&&m.index===q.index));else if(!correct&&!exists)state.mistakes.push({id:q.id,index:q.index});save()}s.checked=true;s.feedback={ok:correct,title:s.showText?'已看原文，本题不计分':correct?'理解得很好。':'再看一下这个知识点。',text:`${correct?'':`正确答案：${q.type==='build'||q.answer===sentence(q.p)?`<span lang="ja">${esc(q.type==='build'?sentence(q.p):q.answer)}</span>`:esc(q.answer)}<br>`}${lessons[q.id].note}`};showStudy()}}
+function start(id){session={materialTab:'overview',lesson:lessons[id],queue:materialQueue(lessons[id],questions(lessons[id]),materials[id]),pos:-1,right:0,graded:0,unscored:0,spoken:false,started:Date.now(),seconds:0};showStudy()}
+function startReview(){const queue=state.mistakes.map(m=>{const q=materialQueue(lessons[m.id],questions(lessons[m.id]),materials[m.id],false)[m.index];return q?{...q,...m}:null}).filter(Boolean);if(!queue.length){toast('这些错题需要对应的本地教材资料。');return}session={lesson:lessons[queue[0].id],queue,pos:0,right:0,graded:0,unscored:0,review:true,started:Date.now(),seconds:0};prepare();showStudy()}
+function prepare(){answerFlow.cancel();session.explanationOpen=false;session.selected=null;session.tokens=[];session.checked=false;session.feedback=null;const q=session.queue[session.pos];session.pool=shuffled(q.p.tokens.map((t,i)=>({t,i})));session.options=q.options?shuffled(q.options):[];session.heard=false;session.recorded=false;session.skipped=false;session.showText=false;if(session.daily){session.learning=false;if(q.fresh&&!session.run.tasks[session.pos].introduced){session.run.tasks[session.pos].introduced=true;state.adaptive.records[q.itemKey]??=introduceItem(Date.now());saveDaily();}const a=session.run.answered;if(a){session.checked=true;session.learning=false;session.feedback=a.feedback;session.selected=a.selected;session.tokens=a.tokens;session.options=a.options;session.showText=a.showText;session.explanationOpen=Boolean(a.explanationOpen);}}}
+function cleanup(){stopSpeech();answerFlow.cancel();cancelNative();recordPending=false;clearTimeout(recordTimer);if(recorder&&recorder.state!=='inactive'){recorder.onstop=null;recorder.stop()}stream?.getTracks().forEach(t=>t.stop());stream=null;recorder=null;if(audioURL){URL.revokeObjectURL(audioURL);audioURL=null}humanPlayer.stop()}
+function showStudy(){
+ let overlay=$('.overlay');
+ if(!overlay){overlay=document.createElement('div');overlay.className='overlay';overlay.setAttribute('role','dialog');overlay.setAttribute('aria-modal','true');overlay.setAttribute('aria-label','日语练习');document.body.append(overlay);$('.shell').inert=true;document.body.style.overflow='hidden';}
+ const s=session,q=s.queue[s.pos],l=q?lessons[q.id]:s.lesson;
+ overlay.innerHTML=`<div class="study ${q?'quick-study':''}"><div class="studyheader"><button class="close" id="quit" aria-label="退出练习">×</button><div class="progress"><span style="width:${Math.max(0,s.pos)/s.queue.length*100}%"></span></div><small>${s.pos<0?'本课学习':Math.min(s.pos+1,s.queue.length)+' / '+s.queue.length}</small></div>${s.pos<0?`<div class="eyebrow">${books[l.book].name} · 第 ${l.no} 课</div>`:''}${s.pos<0?intro(l):s.pos>=s.queue.length?result():missingAudio(q)?unavailableAudio(q):exercise(q,l)}</div>`;
+ $('#quit').onclick=quit;
+ if(s.pos<0){$('#begin').onclick=()=>{s.pos=0;prepare();showStudy();$('.overlay').scrollTop=0;};document.querySelectorAll('[data-say]').forEach(b=>b.onclick=()=>speak(b.dataset.say));bindMaterial();}
+ else if(s.pos>=s.queue.length){$('#finish').onclick=quit;if($('#practiceAgain'))$('#practiceAgain').onclick=()=>{quit();startDaily();};}
+ else if(missingAudio(q))$('#skipMissingAudio').onclick=()=>{s.unscored++;advance();};
+ else bindExercise(q);
+ labelAudioButtons();answerFlow.schedule();autoplayQuestion(s);
+}
+function intro(l){if(materials[l.id])return materialIntro(l,materials[l.id]);return `<h2>先理解，再练习。</h2><span class="bigjp">${l.grammar}</span><p class="intro">${l.note}</p>${l.pairs.map(p=>`<div class="example"><div><div class="jp" lang="ja">${sentence(p)}</div><p>${p.zh}</p></div><button class="sound" data-say="${esc(sentence(p))}" aria-label="朗读例句">${icon('sound')}</button></div>`).join('')}<div class="checkrow"><span class="muted">2 听力 · 3 阅读与组句 · 1 跟读</span><button class="primary" id="begin">开始练习 ${icon('arrow')}</button></div>`}
+function answerFeedback(q){
+ const s=session;if(!s.checked)return '';
+ const answer=q.type==='build'?sentence(q.p):q.answer;
+ const language=q.type==='build'?'ja':q.answerLang||(q.answer===sentence(q.p)?'ja':'zh-CN');
+ return `<div class="answer-feedback ${s.feedback.ok?'correct':'incorrect'}" role="status"><div class="answer-verdict">${s.feedback.ok?`${icon('check')} 正确`:'正确答案'}</div>${!s.feedback.ok?`<p class="answer-correction" lang="${language}">${esc(answer)}</p>`:''}${s.explanationOpen?`<p class="answer-explanation">${esc(q.explanation||lessons[q.id].note)}</p>`:''}<div class="answer-actions">${!s.explanationOpen?'<button class="textbtn" id="explainAnswer">查看解答</button>':''}${!s.feedback.ok||s.explanationOpen?`<button class="primary" id="nextAnswer">${s.feedback.ok?'继续':'知道了'} ${icon('arrow')}</button>`:''}</div></div>`;
+}
+function exercise(q,l){
+ const s=session;
+ return `<h2 class="question-prompt">${q.type==='read'?'选择意思':q.type==='listen'?'听音，选择意思':q.type==='build'?'组成句子':'听示范，跟读'}</h2>${!hasRecording(sentence(q.p))&&canPlay(sentence(q.p))?'<small class="sub">机器朗读</small>':''}${q.type==='read'?`<div class="bigjp" lang="ja">${esc(sentence(q.p))}</div>`:''}${s.daily&&['read','build'].includes(q.type)&&canPlay(sentence(q.p))?`<button class="sound" id="play" aria-label="重听读音">${icon('sound')}</button>`:''}${q.type==='listen'?`<div class="listenarea"><button class="sound" id="play" aria-label="播放读音">${icon('sound')}</button><button class="textbtn" id="slow">慢速</button></div><button class="textbtn" id="transcript">${s.showText?'原文已显示':'听不清，查看原文'}</button>${s.showText?`<p class="bigjp" lang="ja">${esc(sentence(q.p))}</p>`:''}`:''}${q.options?`<div class="options">${s.options.map((o,i)=>`<button class="option ${s.selected===o?'selected':''}" data-option="${i}" ${s.checked||(q.type==='listen'&&!s.heard&&!s.showText)?'disabled':''}><span lang="${q.answerLang||(q.answer===sentence(q.p)?'ja':'zh-CN')}">${esc(o)}</span></button>`).join('')}</div>`:''}${q.type==='build'?`<p class="intro">${esc(q.p.zh)}</p><div class="answerline">${s.tokens.map(i=>`<button class="token" lang="ja" data-remove="${i}" ${s.checked?'disabled':''}>${esc(q.p.tokens[i])}</button>`).join('')}</div><div class="tokens">${s.pool.map(({t,i})=>`<button class="token" lang="ja" data-token="${i}" ${s.tokens.includes(i)||s.checked?'disabled':''}>${esc(t)}</button>`).join('')}</div>`:''}${q.type==='speak'?`<div class="example"><div><div class="jp" lang="ja">${esc(sentence(q.p))}</div><p>${esc(q.p.zh)}</p></div><button class="sound" id="play" aria-label="示范朗读">${icon('sound')}</button></div><div class="recorder"><button class="primary" id="record">${s.recorded?'重新录音':'开始录音'}</button><div id="recordingArea">${audioURL?`<audio controls src="${audioURL}"></audio>`:''}</div><p id="recordStatus" role="status">${s.recorded?'回听后确认完成。':'录音最长 30 秒。'}</p></div><div class="checkrow"><button class="textbtn" id="skipSpeak">跳过跟读</button><button class="primary" id="check" ${s.recorded?'':'disabled'}>回听完成</button></div>`:''}${answerFeedback(q)}`;
+}
+function revealAnswer(){
+ answerFlow.cancel();session.explanationOpen=true;
+ if(session.daily&&session.run.answered){session.run.answered.explanationOpen=true;saveDaily();}
+ showStudy();
+}
+function bindExercise(q){
+ const s=session;
+ document.querySelectorAll('[data-option]').forEach(b=>b.onclick=()=>{if(s!==session||s.checked)return;s.selected=s.options[Number(b.dataset.option)];submitAnswer(q);});
+ document.querySelectorAll('[data-token]').forEach(b=>b.onclick=()=>{if(s!==session||s.checked||s.tokens.includes(Number(b.dataset.token)))return;s.tokens.push(Number(b.dataset.token));if(s.tokens.length===q.p.tokens.length)submitAnswer(q);else showStudy();});
+ document.querySelectorAll('[data-remove]').forEach(b=>b.onclick=()=>{if(s.checked)return;s.tokens=s.tokens.filter(i=>i!==Number(b.dataset.remove));showStudy();});
+ if($('#play'))$('#play').onclick=()=>speak(sentence(q.p));
+ if($('#slow'))$('#slow').onclick=()=>speak(sentence(q.p),true);
+ if($('#transcript'))$('#transcript').onclick=()=>{s.showText=true;showStudy();};
+ if($('#record'))$('#record').onclick=record;
+ if($('#skipSpeak'))$('#skipSpeak').onclick=()=>{s.skipped=true;advance();};
+ if($('#check'))$('#check').onclick=()=>submitAnswer(q);
+ if($('#explainAnswer')){const b=$('#explainAnswer');b.onpointerdown=()=>answerFlow.cancel();b.onfocus=()=>answerFlow.cancel();b.onblur=()=>answerFlow.schedule();b.onpointercancel=()=>answerFlow.schedule();b.onclick=revealAnswer;}
+ if($('#nextAnswer'))$('#nextAnswer').onclick=()=>{if(session===s)advance();};
+}
+function submitAnswer(q){
+ const s=session;if(!s||s.checked||s.queue[s.pos]!==q)return;
+ if(q.type==='listen'&&!s.heard&&!s.showText)return;
+ if(q.type==='build'&&s.tokens.length!==q.p.tokens.length)return;
+ if(q.options&&s.selected===null)return;
+ if(q.type==='speak'&&!s.recorded)return;
+ if(s.daily){answerDaily(q);return;}
+ if(q.type==='speak'){s.spoken=true;advance();return;}
+ const correct=q.type==='build'?s.tokens.map(i=>q.p.tokens[i]).join('')===q.p.tokens.join(''):s.selected===q.answer;
+ if(s.showText)s.unscored++;
+ if(!s.showText){s.graded++;if(correct)s.right++;const exists=state.mistakes.some(m=>m.id===q.id&&m.index===q.index);if(correct&&s.review)state.mistakes=state.mistakes.filter(m=>!(m.id===q.id&&m.index===q.index));else if(!correct&&!exists)state.mistakes.push({id:q.id,index:q.index});save();}
+ s.checked=true;s.feedback={ok:correct};showStudy();
+}
 async function record(){if(isNative()){recordOnIPad();return}if(recordPending)return;if(recorder?.state==='recording'){recorder.stop();return}if(!navigator.mediaDevices?.getUserMedia||!window.MediaRecorder){toast('此浏览器无法录音，请在 localhost 或 HTTPS 下使用支持录音的浏览器。');return}recordPending=true;session.recorded=false;$('#check').disabled=true;const current=session;const pos=session.pos;try{cleanup();const acquired=await navigator.mediaDevices.getUserMedia({audio:true});if(session!==current||session.pos!==pos){acquired.getTracks().forEach(t=>t.stop());return}stream=acquired;recorder=new MediaRecorder(stream);const chunks=[];recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};recorder.onstop=()=>{clearTimeout(recordTimer);stream?.getTracks().forEach(t=>t.stop());stream=null;if(session!==current||session.pos!==pos)return;audioURL=URL.createObjectURL(new Blob(chunks,{type:recorder.mimeType}));session.recorded=true;showStudy()};recorder.start();$('#record').textContent='结束录音';$('#recordStatus').textContent='正在录音… 再次点击结束，30 秒后自动停止。';recordTimer=setTimeout(()=>{if(recorder?.state==='recording')recorder.stop()},30000)}catch{toast('没有获得麦克风权限。可在浏览器中允许录音，或跳过本次口语。')}finally{recordPending=false}}
 
 function recordOnIPad(){
@@ -212,13 +491,88 @@ function recordOnIPad(){
 window.addEventListener('hiyori-message',e=>toast(e.detail));
 document.addEventListener('visibilitychange',()=>{if(document.hidden&&isNative()){cleanup();if(session&&session.queue[session.pos]?.type==='speak'){session.recorded=false;showStudy();}}});
 
-function advance(){cleanup();session.pos++;if(session.pos>=session.queue.length){if(!session.saved){if(!session.review)state.done[session.lesson.id]={at:day(),correct:session.right,total:session.graded,speaking:session.spoken};session.saved=true;save()}}else prepare();showStudy()}
-function result(){const s=session;return `<div class="results"><h2>练习完成</h2><p class="sub">${s.review?'答对的题目已移出错题本。':'学习记录已保存。'}</p><div class="resultstats"><strong>${s.graded?`${s.right} / ${s.graded}`:'—'}</strong><span>${s.graded?'客观题答对':'本次未作答计分题'}</span></div><p class="sub">${s.review?'':s.spoken?'口语：已录音、自评完成':'口语：本次已跳过'}${s.unscored>0?' · 显示原文的听力题不计分':''}</p><button class="primary" id="finish">返回课程 ${icon('arrow')}</button></div>`}
-function quit(){cleanup();session=null;$('.overlay')?.remove();$('.shell').inert=false;document.body.style.overflow='';render()}
+function advance(){if(session.daily){advanceDaily();return}cleanup();session.pos++;if(session.pos>=session.queue.length){if(!session.saved){if(!session.review)state.done[session.lesson.id]={at:day(),correct:session.right,total:session.graded,speaking:session.spoken,materialVersion:materials[session.lesson.id]?.version};session.saved=true;save()}}else prepare();showStudy();$('.overlay').scrollTop=0;}
+function result(){const s=session;if(s.daily)return dailyResult();return `<div class="results"><h2>练习完成</h2><p class="sub">${s.review?'答对的题目已移出错题本。':'学习记录已保存。'}</p><div class="resultstats"><strong>${s.graded?`${s.right} / ${s.graded}`:'—'}</strong><span>${s.graded?'客观题答对':'本次未作答计分题'}</span></div><p class="sub">${s.review?'':s.spoken?'口语：已录音、自评完成':'口语：本次已跳过'}${s.unscored>0?' · 跳过或看过原文的题不计分':''}</p><button class="primary" id="finish">返回课程 ${icon('arrow')}</button></div>`}
+function quit(){if(session?.daily&&!session.saved)saveDaily();cleanup();session=null;$('.overlay')?.remove();$('.shell').inert=false;document.body.style.overflow='';render()}
 // 仅计入页面可见且正在练习的时间，每秒保存，避免退出或刷新丢失。
 setInterval(()=>{if(session&&session.pos<session.queue.length&&!document.hidden){state.days[day()]=(state.days[day()]||0)+1;save()}},1000);
-render();
+Promise.all([loadLocalMaterials(),loadHumanAudio()]).then(([value,clips])=>{
+ materials=value;humanClips=clips;studyPool=learningPool(materials).map(i=>({...i,hasAudio:hasRecording(i.ja)}));
+ if(state.adaptive.audioPolicy!=='human-only-v1'){for(const r of Object.values(state.adaptive.records)){if(r.modes)delete r.modes.listen;}state.adaptive.audioPolicy='human-only-v1';save();}
+ render();
+ if(preview.lesson!==null){start(preview.lesson);if(preview.step!==null){session.pos=preview.step;prepare();showStudy();}}
+});
 
-if(preview.lesson!==null){start(preview.lesson);if(preview.step!==null){session.pos=preview.step;prepare();showStudy();}}
+function materialIntro(l,m){
+ const tab=session.materialTab||'overview';
+ const sections=[['overview','本课'],['vocabulary','词汇'],['texts','课文'],['grammar','语法'],['pages','原书']];
+ const counts=session.queue.reduce((out,q)=>(out[q.type]=(out[q.type]||0)+1,out),{});
+ const start=`<div class="material-actions"><span class="sub">${counts.listen||0} 听力 · ${(counts.read||0)+(counts.build||0)} 阅读与组句 · ${counts.speak||0} 跟读</span><button class="primary" id="begin">开始 ${session.queue.length} 题练习 ${icon('arrow')}</button></div>`;
+ let content='';
+ if(tab==='overview')content=`<p class="intro">从词汇和课文开始，理解句型后再做练习。你可以随时切换，不必一次学完。</p><div class="material-overview">${[['vocabulary',m.vocabulary.length+' 个词条','假名、释义与点读'],['texts','基本与应用课文','逐句阅读、查看译文'],['grammar',m.grammar.length+' 组语法与表达','中文讲解与例句'],['pages','原书对照','课文、扩展表与练习页']].map(([key,title,desc])=>`<button data-material="${key}"><strong>${esc(title)}</strong><span>${esc(desc)}</span></button>`).join('')}</div><p class="sub">教材日文依据你提供的扫描本整理；中文课文译文、语法笔记和互动题为配套整理。原书扩展表、书面练习与专栏可在“原书”查看。</p>`;
+ if(tab==='vocabulary')content=`<label class="sub" for="vocabSearch">搜索日文、假名或中文</label><input id="vocabSearch" class="search" type="search" placeholder="例如：会社員、かいしゃいん、公司"><p class="sub material-hint">点击词条展开释义；有真人录音时可点读，缺失时按钮暂不可用。共 ${m.vocabulary.length} 项。</p><div id="vocabRows" class="vocab-grid">${vocabRows(m.vocabulary)}</div>`;
+ if(tab==='texts')content=m.texts.map(t=>`<section class="text-section"><h3>${esc(t.title)}</h3><p class="sub">书页 ${t.page} · 译文为配套整理</p>${t.context?`<p class="intro">${esc(t.context)}</p>`:''}${t.lines.map(x=>`<div class="text-line"><div>${x.speaker?`<span class="sub">${esc(x.speaker)}</span>`:''}<p class="jp" lang="ja">${esc(x.ja)}</p>${audioSource(x.ja)}<details><summary>查看译文</summary><p>${esc(x.zh)}</p></details></div><button class="sound" data-say="${esc(x.ja)}" aria-label="朗读：${esc(x.ja)}">${icon('sound')}</button></div>`).join('')}</section>`).join('');
+ if(tab==='grammar')content=`<p class="sub material-hint">以下为按本课知识点整理的中文笔记。教材原文见“原书”。</p>${m.grammar.map(g=>`<section class="material-grammar"><h3>${esc(g.title)}</h3><p class="intro">${esc(g.note)}</p><p class="jp" lang="ja">${esc(g.example)}</p><p class="sub">对应书页 ${g.page}</p></section>`).join('')}`;
+ if(tab==='pages')content=`<p class="sub material-hint">${esc(m.sourcePages)}。可对照原书核查用字、注音和扩展内容。</p>${m.pages.map(p=>`<details class="source-page"><summary>${esc(p.label)}</summary><img src="${esc(p.src)}" alt="${esc(p.label)}教材扫描页" loading="lazy"></details>`).join('')}`;
+ return `<h2 lang="ja">${esc(m.title)}</h2><p class="sub">${esc(m.sourcePages)} · 仅使用有来源的真人录音</p><div class="tabs material-tabs" role="tablist" aria-label="本课内容">${sections.map(([key,title])=>`<button role="tab" aria-selected="${tab===key}" class="${tab===key?'active':''}" data-material="${key}">${title}</button>`).join('')}</div>${start}<div class="material-panel">${content}</div>`;
+}
+function vocabRows(items){return items.length?items.map(v=>`<div class="vocab-row"><details><summary><span lang="ja">${esc(v.ja)}</span><small lang="ja">${esc(v.kana)}</small></summary><p>${esc(v.zh)}</p><span class="sub">${esc(v.kind)}</span>${audioSource(v.ja)}</details><button class="sound" data-say="${esc(v.ja)}" aria-label="朗读单词：${esc(v.ja)}">${icon('sound')}</button></div>`).join(''):'<p class="sub">没有匹配的词条。</p>'}
+function bindMaterial(){
+ document.querySelectorAll('[data-material]').forEach(b=>b.onclick=()=>{session.materialTab=b.dataset.material;stopSpeech();humanPlayer.stop();showStudy();$('.overlay').scrollTop=0;});
+ if($('#vocabSearch'))$('#vocabSearch').oninput=e=>{const query=e.target.value.trim().toLowerCase();$('#vocabRows').innerHTML=vocabRows(materials[session.lesson.id].vocabulary.filter(v=>`${v.ja}${v.kana}${v.zh}`.toLowerCase().includes(query)));$('#vocabRows').querySelectorAll('[data-say]').forEach(b=>b.onclick=()=>speak(b.dataset.say));labelAudioButtons();};
+}
+
+function dailyHome(){
+ const stats=adaptiveStats(studyPool,state.adaptive.records),run=state.adaptive.run;
+ dailyRefreshKey=adaptiveDay(Date.now())+':'+stats.due;
+ const eligible=choosePractice(studyPool,state.adaptive.records);
+ return `<div class="heading"><div><h1>混池</h1><p class="sub">词汇和句子混合出现，按你的记忆情况安排下一次。</p></div></div><div class="daily-stats"><div><strong>${stats.due}</strong><span>到期复习</span></div><div><strong>${stats.active}</strong><span>正在学习</span></div><div><strong>${stats.mastered}</strong><span>已掌握</span></div></div><section class="daily-start"><h2>${run?'接着上次继续':eligible.length?'随时学，再来一轮':'暂无学习内容'}</h2><p class="intro">${run?`已完成 ${run.pos+(run.answered?1:0)} / ${run.tasks.length} 题，退出或刷新后也能继续。`:!studyPool.length?'整理好的教材会自动加入学习池。现在可先去课程页浏览示例。':'优先复习到期内容，穿插新词句。不限轮数，想学就继续。'}</p>${run||eligible.length?`<button class="primary" id="dailyStart">${run?'继续这一轮':'开始混学'} ${icon('arrow')}</button>`:'<button class="pill" data-nav="home">浏览课程</button>'}</section><p class="sub daily-source">学习池：${studyPool.length} 项，来自 ${Object.keys(materials).length} 课已整理教材。未整理的课次暂不混入。新内容按教材课次逐步加入。</p><p class="sub audio-source">真人录音覆盖 ${studyPool.filter(i=>i.hasAudio).length} / ${studyPool.length} 项；句子缺少录音时暂用机器朗读。</p>${stats.active||stats.mastered?`<details class="memory-list"><summary>查看各项学习状态</summary>${studyPool.filter(i=>state.adaptive.records[i.key]).map(i=>{const r=state.adaptive.records[i.key];return `<div class="memory-row"><div><span class="jp" lang="ja">${esc(i.ja)}</span><small>${esc(i.zh)}</small></div><span class="sub">${isMastered(r)?'已掌握':r.stage?'巩固中':'学习中'}<br>${new Date(r.due).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})} 复习</span></div>`}).join('')}</details>`:''}`;
+}
+function startDaily(){
+ let run=state.adaptive.run;
+ if(run&&!run.tasks.every(t=>studyPool.some(i=>i.key===t.key))){toast('本轮需要的教材资料暂时不可用，请恢复对应本地资料。');return;}
+ if(!run){const tasks=choosePractice(studyPool,state.adaptive.records);if(!tasks.length){render();return;}
+  run={tasks,pos:0,right:0,graded:0,unscored:0,spoken:false,retried:[],answered:null,started:Date.now(),masteredBefore:adaptiveStats(studyPool,state.adaptive.records).mastered};
+  state.adaptive.run=run;save();
+ }
+ session={daily:true,run,lesson:lessons[studyPool.find(i=>i.key===run.tasks[0].key).lessonId],queue:dailyQueue(run.tasks),pos:run.pos,right:run.right,graded:run.graded,unscored:run.unscored,spoken:run.spoken,started:run.started};
+ if(session.pos>=session.queue.length){state.adaptive.run=null;session.saved=true;save();}else prepare();showStudy();
+}
+function dailyQueue(tasks){return tasks.map(t=>{const item=studyPool.find(i=>i.key===t.key);return {...practiceQuestion(item,t,studyPool),itemKey:t.key,itemKind:item.kind,fresh:t.fresh,retry:t.retry};});}
+function saveDaily(){
+ const s=session;if(!s?.daily||s.saved)return;
+ Object.assign(s.run,{pos:s.pos,right:s.right,graded:s.graded,unscored:s.unscored,spoken:s.spoken});state.adaptive.run=s.run;save();
+}
+function answerDaily(q){
+ const s=session;
+ if(q.type==='speak'){s.spoken=true;advanceDaily();return;}
+ const correct=q.type==='build'?s.tokens.map(i=>q.p.tokens[i]).join('')===q.p.tokens.join(''):s.selected===q.answer;
+ if(s.showText)s.unscored++;else{s.graded++;if(correct)s.right++;}
+ // A revealed transcript is learning, not a failed independent recall.
+ const r=recordRecall(state.adaptive.records[q.itemKey],{correct:s.showText?true:correct,hinted:s.showText||q.fresh,mode:q.type});
+ state.adaptive.records[q.itemKey]=r;
+ let retryAdded=false;
+ if(!correct&&!s.showText){
+  const tasks=appendRetry(s.run.tasks,s.pos,s.run.retried,q.itemKey);
+  if(tasks!==s.run.tasks){retryAdded=true;s.run.tasks=tasks;s.run.retried.push(q.itemKey);s.queue=dailyQueue(tasks);}
+ }
+ const when=new Date(r.due).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
+ s.checked=true;
+ s.feedback={ok:correct,title:s.showText?'已看原文，作为学习记录':correct?(q.fresh?'已学过，之后再独立回想':'回想正确'):'这项还需要再练',text:`${correct?'':`正确答案：${esc(q.type==='build'?sentence(q.p):q.answer)}<br>`}${esc(q.explanation)}<br>${isMastered(r)?'已掌握，转入低频复习。':'下次到期：'}${when}${retryAdded?'；本轮还会隔题再练一次。':''}`};
+ s.run.answered={feedback:s.feedback,selected:s.selected,tokens:s.tokens,options:s.options,showText:s.showText};saveDaily();showStudy();
+}
+function advanceDaily(){
+ cleanup();session.pos++;session.run.answered=null;
+ if(session.pos>=session.queue.length){session.saved=true;state.adaptive.run=null;save();}else{saveDaily();prepare();}
+ showStudy();$('.overlay').scrollTop=0;
+}
+function dailyResult(){
+ const s=session,stats=adaptiveStats(studyPool,state.adaptive.records);
+ return `<div class="results"><h2>这一轮完成了</h2><p class="sub">学习进度已保存，可以继续下一轮。</p><div class="resultstats"><strong>${s.right} / ${s.graded}</strong><span>客观题答对</span></div><p class="intro">正在学习 ${stats.active} 项 · 已掌握 ${stats.mastered} 项</p><p class="sub">${s.spoken?'跟读已完成':'跟读未完成或已跳过'} · 跟读自评不影响掌握判定${s.unscored?' · 跳过或看过原文的题不计分':''}</p><button class="primary" id="practiceAgain">再来一轮 ${icon('arrow')}</button><button class="textbtn" id="finish">返回混池</button></div>`;
+}
+
+setInterval(()=>{if(!session&&view==='today'&&!document.hidden){const key=adaptiveDay(Date.now())+':'+adaptiveStats(studyPool,state.adaptive.records).due;if(key!==dailyRefreshKey)render();}},15000);
+
+document.addEventListener('visibilitychange',()=>{if(document.hidden){answerFlow.cancel();humanPlayer.stop();stopSpeech();}else{answerFlow.schedule();autoplayQuestion(session);}});
 
 })();

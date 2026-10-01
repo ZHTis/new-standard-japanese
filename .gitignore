@@ -11,3 +11,11 @@ xcuserdata/
 *.pem
 node_modules/
 *.log
+
+# Personal textbook imports and their generated iPad copies stay local.
+/private-materials/
+/ipad/Hiyori/Resources/private-materials/
+/tmp/pdfs/
+
+# Local audio-tool session artifact.
+/:memory:.ses

@@ -9,6 +9,7 @@ struct StudyWebView: UIViewRepresentable {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         configuration.allowsInlineMediaPlayback = true
+        configuration.mediaTypesRequiringUserActionForPlayback = []
         configuration.userContentController.add(context.coordinator, name: "hiyori")
         // Native storage survives app updates even if the bundle's file URL changes.
         let saved = UserDefaults.standard.string(forKey: "hiyori.progress") ?? "null"
@@ -37,7 +38,7 @@ struct StudyWebView: UIViewRepresentable {
         uiView.configuration.userContentController.removeScriptMessageHandler(forName: "hiyori")
     }
 
-    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, AVAudioRecorderDelegate {
+    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, AVAudioRecorderDelegate, AVSpeechSynthesizerDelegate {
         weak var webView: WKWebView?
         private let speech = AVSpeechSynthesizer()
         private var recorder: AVAudioRecorder?
@@ -47,6 +48,7 @@ struct StudyWebView: UIViewRepresentable {
 
         override init() {
             super.init()
+            speech.delegate = self
             // Remove only this app's recordings left by a previous forced exit.
             let temporary = FileManager.default.temporaryDirectory
             if let files = try? FileManager.default.contentsOfDirectory(at: temporary, includingPropertiesForKeys: nil) {
@@ -105,6 +107,10 @@ struct StudyWebView: UIViewRepresentable {
             guard let data = try? JSONSerialization.data(withJSONObject: event),
                   let json = String(data: data, encoding: .utf8) else { return }
             webView?.evaluateJavaScript("window.hiyoriNativeEvent && window.hiyoriNativeEvent(\(json));", completionHandler: nil)
+        }
+
+        func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+            emit(["type": "speechStarted", "text": utterance.speechString])
         }
 
         private func speak(_ text: String, rate: Float) {
