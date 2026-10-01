@@ -25,6 +25,6 @@
 
 ## 设备与数据
 
-学习记录存在当前浏览器 localStorage，清除站点数据将清除记录。录音仅在内存中用于回放，退出该题释放，不上传。麦克风需要用户授权，浏览器通常要求 localhost 或 HTTPS。朗读依赖设备可用的日语 SpeechSynthesis 语音。界面使用系统字体，无需在线下载字体。
+学习记录存在当前浏览器 localStorage，清除站点数据将清除记录。录音仅在内存中用于回放，退出该题释放，不上传。麦克风需要用户授权，浏览器通常要求 localhost 或 HTTPS。朗读依赖设备可用的日语 SpeechSynthesis 语音。中文使用 Noto Serif SC，日文使用 Zen Kurenaido，英文和数字使用 Clarity City。字体文件随网页和 iPad 工程内置，无需联网下载；SIL OFL 授权文本保存在 `src/fonts`。
 
 `src/data.js` 管理内容，`src/app.js` 管理学习交互，`src/style.css` 包含桌面和手机布局。

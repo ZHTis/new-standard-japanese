@@ -1,0 +1,25 @@
+@font-face {
+  font-family: 'Clarity City';
+  src: url('./fonts/ClarityCity-VariableFont_wght.ttf') format('truetype');
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Noto Serif SC';
+  src: url('./fonts/NotoSerifSC-VariableFont_wght.ttf') format('truetype');
+  font-style: normal;
+  font-weight: 200 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Zen Kurenaido';
+  src: url('./fonts/ZenKurenaido-Regular.ttf') format('truetype');
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+:root {
+  --font-ui: 'Clarity City', 'Noto Serif SC', serif;
+  --font-ja: 'Clarity City', 'Zen Kurenaido', 'Noto Serif SC', serif;
+}
